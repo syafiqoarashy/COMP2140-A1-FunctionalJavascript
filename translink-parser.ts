@@ -3,7 +3,7 @@ import {parse} from "csv-parse";
 import * as fs from "node:fs/promises";
 import fetch from 'node-fetch';
 import * as path from 'path';
-import {Route, Stop, StopTime, Trip} from "./commons";
+import {Calendar, Route, Stop, StopTime, Trip} from "./commons";
 
 const prompt = promptSync();
 const CACHE_DIR = './cached-data';
@@ -31,14 +31,24 @@ const loadJSON = async (url: string, cacheFile: string): Promise<any> => {
         }
     } catch (err) {}
 
-    const response = await fetch(url);
-    if (!response.ok) {
-        throw new Error(`Failed to fetch data from ${url}`);
-    }
-    const data = await response.json();
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch data from ${url}`);
+        }
+        const data = await response.json();
 
-    await fs.writeFile(cachePath, JSON.stringify(data, null, 2), 'utf-8');
-    return data;
+        await fs.writeFile(cachePath, JSON.stringify(data, null, 2), 'utf-8');
+        return data;
+    } catch (error) {
+        console.warn(`Failed to fetch live data, falling back to cached data for ${cacheFile}`);
+        try {
+            return JSON.parse(await fs.readFile(cachePath, 'utf-8'));
+        } catch (cacheError) {
+            console.error(`No cached data available for ${cacheFile}`);
+            return null;
+        }
+    }
 };
 
 const matchRouteIds = (staticRouteId: string, realtimeRouteId: string): boolean => {
@@ -150,18 +160,32 @@ const filterTripsForUpcomingDepartures = (
     trips: Trip[],
     startStop: Stop,
     endStop: Stop,
-    currentDateTime: Date
+    currentDateTime: Date,
+    calendar: Calendar[]
 ) => {
     const tenMinutesLater = new Date(currentDateTime.getTime() + 10 * 60000);
 
     console.log(`Filtering trips for start stop: ${startStop.stop_id}`);
     console.log(`Current date/time: ${currentDateTime.toLocaleString('en-AU', { timeZone: 'Australia/Brisbane' })}`);
 
+    const isServiceRunning = (serviceId: string, date: Date): boolean => {
+        const dayOfWeek = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'][date.getDay()];
+        const serviceCalendar = calendar.find(c => c.service_id === serviceId);
+        return serviceCalendar ? serviceCalendar[dayOfWeek as keyof Calendar] === '1' : false;
+    };
+
     const filteredStopTimes = stopTimes.filter(stopTime => {
         if (stopTime.stop_id === startStop.stop_id) {
-            const arrivalTime = stopTime.arrival_time || stopTime.departure_time;
-            const arrivalDateTime = new Date(`${currentDateTime.toISOString().split('T')[0]}T${arrivalTime}+10:00`);
-            return arrivalDateTime >= currentDateTime && arrivalDateTime <= tenMinutesLater;
+            const trip = trips.find(t => t.trip_id === stopTime.trip_id);
+            if (!trip || !isServiceRunning(trip.service_id, currentDateTime)) {
+                return false;
+            }
+            const departureTime = stopTime.departure_time || stopTime.arrival_time;
+            const [hours, minutes] = departureTime.split(':').map(Number);
+            const departureDateTime = new Date(currentDateTime);
+            departureDateTime.setHours(hours, minutes, 0, 0);
+
+            return departureDateTime >= currentDateTime && departureDateTime <= tenMinutesLater;
         }
         return false;
     });
@@ -176,6 +200,9 @@ const filterTripsForUpcomingDepartures = (
 };
 
 const matchLiveData = (tripUpdates: any[], vehiclePositions: any[], stopTime: StopTime, routeId: string) => {
+    if (!tripUpdates || !vehiclePositions) {
+        return { liveArrivalTime: 'N/A', livePosition: 'N/A' };
+    }
     const relevantTripUpdates = tripUpdates.filter(update => {
         if (!update.tripUpdate || !update.tripUpdate.trip || !update.tripUpdate.stopTimeUpdate) {
             return false;
@@ -206,7 +233,12 @@ const matchLiveData = (tripUpdates: any[], vehiclePositions: any[], stopTime: St
 
     return {
         liveArrivalTime: stopTimeUpdate?.arrival?.time
-            ? new Date(stopTimeUpdate.arrival.time * 1000).toISOString().split('T')[1].slice(0, 5)
+            ? new Date(stopTimeUpdate.arrival.time * 1000).toLocaleTimeString('en-AU', {
+                timeZone: 'Australia/Brisbane',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            })
             : 'N/A',
         livePosition: relevantVehiclePosition
             ? `${relevantVehiclePosition.vehicle.position.latitude}, ${relevantVehiclePosition.vehicle.position.longitude}`
@@ -215,19 +247,31 @@ const matchLiveData = (tripUpdates: any[], vehiclePositions: any[], stopTime: St
 };
 
 const calculateTravelTime = (startTime: string, endTime: string): string => {
-    const start = new Date(`1970-01-01T${startTime}`);
-    const end = new Date(`1970-01-01T${endTime}`);
-    let diff = end.getTime() - start.getTime();
+    const [startHours, startMinutes] = startTime.split(':').map(Number);
+    const [endHours, endMinutes] = endTime.split(':').map(Number);
 
-    if (diff < 0) {
-        diff += 24 * 60 * 60 * 1000;
+    let startDateTime = new Date(0);
+    let endDateTime = new Date(0);
+
+    startDateTime.setHours(startHours, startMinutes);
+    endDateTime.setHours(endHours, endMinutes);
+
+    if (endDateTime < startDateTime) {
+        endDateTime.setDate(endDateTime.getDate() + 1);
     }
 
-    const hours = Math.floor(diff / (60 * 60 * 1000));
-    const minutes = Math.floor((diff % (60 * 60 * 1000)) / (60 * 1000));
+    const diffMs = endDateTime.getTime() - startDateTime.getTime();
+    const diffMinutes = Math.floor(diffMs / 60000);
+    const hours = Math.floor(diffMinutes / 60);
+    const minutes = diffMinutes % 60;
 
-    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+    if (hours === 0) {
+        return `${minutes} minute${minutes !== 1 ? 's' : ''}`;
+    } else {
+        return `${hours} hour${hours !== 1 ? 's' : ''} ${minutes} minute${minutes !== 1 ? 's' : ''}`;
+    }
 };
+
 
 const main = async () => {
     console.log("Welcome to the South East Queensland Route Planner!");
@@ -236,6 +280,7 @@ const main = async () => {
     const stops = await loadCSV('./static-data/stops.txt') as Stop[];
     const stopTimes = await loadCSV('./static-data/stop_times.txt') as StopTime[];
     const trips = await loadCSV('./static-data/trips.txt') as Trip[];
+    const calendar = await loadCSV('./static-data/calendar.txt') as Calendar[];
 
     const tripUpdates = (await loadJSON('http://127.0.0.1:5343/gtfs/seq/trip_updates.json', 'trip_updates.json')).entity;
     const vehiclePositions = (await loadJSON('http://127.0.0.1:5343/gtfs/seq/vehicle_positions.json', 'vehicle_positions.json')).entity;
@@ -269,7 +314,7 @@ const main = async () => {
 
         console.log(`You've chosen to travel on ${date} at ${time}.`);
 
-        const upcomingStopTimes = filterTripsForUpcomingDepartures(stopTimes, trips, startAndEndStops.start, startAndEndStops.end, currentDateTime);
+        const upcomingStopTimes = filterTripsForUpcomingDepartures(stopTimes, trips, startAndEndStops.start, startAndEndStops.end, currentDateTime, calendar);
 
         const result = upcomingStopTimes.map(({ startStopTime, endStopTime, routeId }) => {
             const trip = trips.find(trip => trip.trip_id === startStopTime.trip_id);
@@ -277,22 +322,30 @@ const main = async () => {
 
             const liveData = matchLiveData(tripUpdates, vehiclePositions, startStopTime, routeId);
 
-            const estimatedTravelTime = endStopTime
-                ? calculateTravelTime(startStopTime.departure_time || startStopTime.arrival_time, endStopTime.arrival_time || endStopTime.departure_time)
-                : "N/A";
+            const startTime = startStopTime.arrival_time || startStopTime.departure_time;
+            const endTime = endStopTime ? (endStopTime.arrival_time || endStopTime.departure_time) : null;
+
+            const estimatedTravelTime = endTime ? calculateTravelTime(startTime, endTime) : "N/A";
+
+            const scheduledArrivalTime = new Date(`1970-01-01T${startTime}`).toLocaleTimeString('en-AU', {
+                timeZone: 'Australia/Brisbane',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            });
 
             return {
                 "Route Short Name": routeDetails?.route_short_name || "N/A",
                 "Route Long Name": routeDetails?.route_long_name || "N/A",
                 "Service ID": trip?.service_id || "N/A",
                 "Heading Sign": trip?.trip_headsign || "N/A",
-                "Scheduled Arrival Time": startStopTime.arrival_time || startStopTime.departure_time,
+                "Scheduled Arrival Time": scheduledArrivalTime,
                 "Live Arrival Time": liveData?.liveArrivalTime || "N/A",
                 "Live Position": liveData?.livePosition || "N/A",
                 "Estimated Travel Time": estimatedTravelTime,
             };
         });
-
+        
         if (result.length > 0) {
             console.table(result);
         } else {

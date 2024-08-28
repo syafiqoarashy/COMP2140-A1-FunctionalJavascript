@@ -31,13 +31,13 @@ export interface Trip {
 
 export interface Calendar {
     service_id: string;
-    monday: number;
-    tuesday: number;
-    wednesday: number;
-    thursday: number;
-    friday: number;
-    saturday: number;
-    sunday: number;
+    monday: string;
+    tuesday: string;
+    wednesday: string;
+    thursday: string;
+    friday: string;
+    saturday: string;
+    sunday: string;
     start_date: string;
     end_date: string;
 }
