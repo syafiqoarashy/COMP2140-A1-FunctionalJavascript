@@ -1,23 +1,12 @@
 import promptSync from 'prompt-sync';
-import {parse} from "csv-parse";
 import * as fs from "node:fs/promises";
 import fetch from 'node-fetch';
 import * as path from 'path';
-import {Calendar, Route, Stop, StopTime, Trip} from "./commons";
+import Dataframe from "./dataframe";
 
 const prompt = promptSync();
 const CACHE_DIR = './cached-data';
 const CACHE_DURATION = 5 * 60 * 1000;
-
-const loadCSV = async (filePath: string): Promise<any[]> => {
-    const content = await fs.readFile(filePath, 'utf-8');
-    return new Promise((resolve, reject) => {
-        parse(content, { columns: true }, (err, records) => {
-            if (err) reject(err);
-            else resolve(records);
-        });
-    });
-};
 
 const loadJSON = async (url: string, cacheFile: string): Promise<any> => {
     const cachePath = path.join(CACHE_DIR, cacheFile);
@@ -57,56 +46,17 @@ const matchRouteIds = (staticRouteId: string, realtimeRouteId: string): boolean 
     return staticMainRoute === realtimeMainRoute;
 };
 
-const getRoute = (routes: Route[]): string => {
+const getRoute = (routesDF: Dataframe): string => {
     while (true) {
         const route = prompt("What Bus Route would you like to take? ");
-        if (route && routes.some(r => r.route_short_name === route)) {
+        if (route && routesDF.filter(row => row.route_short_name === route).data.length > 0) {
             return route;
         }
         console.log("Please enter a valid bus route.");
     }
 };
 
-const getRouteStops = (
-    route: string,
-    routes: Route[],
-    stops: Stop[],
-    stopTimes: StopTime[],
-    trips: Trip[]
-): Stop[] => {
-    const routeInfo = routes.find(r => r.route_short_name === route);
-    if (!routeInfo) return [];
-
-    const routeTrips = trips.filter(trip => trip.route_id === routeInfo.route_id);
-
-    let allStopTimes: {stop: Stop, sequence: number, direction: number}[] = [];
-
-    routeTrips.forEach(trip => {
-        const tripStopTimes = stopTimes
-            .filter(st => st.trip_id === trip.trip_id)
-            .map(st => ({
-                stop: stops.find(stop => stop.stop_id === st.stop_id) as Stop,
-                sequence: st.stop_sequence,
-                direction: trip.direction_id
-            }))
-            .filter(item => item.stop);
-
-        allStopTimes = allStopTimes.concat(tripStopTimes);
-    });
-
-    allStopTimes.sort((a, b) => {
-        if (a.direction !== b.direction) return a.direction - b.direction;
-        return a.sequence - b.sequence;
-    });
-
-    const uniqueStops = allStopTimes.filter((item, index, self) =>
-        index === self.findIndex((t) => t.stop.stop_id === item.stop.stop_id && t.direction === item.direction)
-    );
-
-    return uniqueStops.map(item => item.stop);
-};
-
-const getStartAndEndStops = (stops: Stop[]): { start: Stop, end: Stop } | null => {
+const getStartAndEndStops = (stops: any[]): { start: any, end: any } | null => {
     while (true) {
         const input = prompt("What is your start and end stop on the route? (e.g., 1 - 2) ");
         const match = input.match(/^\s*(\d+)\s*-\s*(\d+)\s*$/);
@@ -155,91 +105,87 @@ const getTime = (): string => {
     }
 };
 
-const filterTripsForUpcomingDepartures = (
-    stopTimes: StopTime[],
-    trips: Trip[],
-    startStop: Stop,
-    endStop: Stop,
-    currentDateTime: Date,
-    calendar: Calendar[]
+const matchLiveData = (
+    tripUpdates: any[],
+    vehiclePositions: any[],
+    stopTime: any,
+    routeId: string,
+    userDateTime: Date
 ) => {
-    const tenMinutesLater = new Date(currentDateTime.getTime() + 10 * 60000);
-
-    console.log(`Filtering trips for start stop: ${startStop.stop_id}`);
-    console.log(`Current date/time: ${currentDateTime.toLocaleString('en-AU', { timeZone: 'Australia/Brisbane' })}`);
-
-    const isServiceRunning = (serviceId: string, date: Date): boolean => {
-        const dayOfWeek = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'][date.getDay()];
-        const serviceCalendar = calendar.find(c => c.service_id === serviceId);
-        return serviceCalendar ? serviceCalendar[dayOfWeek as keyof Calendar] === '1' : false;
-    };
-
-    const filteredStopTimes = stopTimes.filter(stopTime => {
-        if (stopTime.stop_id === startStop.stop_id) {
-            const trip = trips.find(t => t.trip_id === stopTime.trip_id);
-            if (!trip || !isServiceRunning(trip.service_id, currentDateTime)) {
-                return false;
-            }
-            const departureTime = stopTime.departure_time || stopTime.arrival_time;
-            const [hours, minutes] = departureTime.split(':').map(Number);
-            const departureDateTime = new Date(currentDateTime);
-            departureDateTime.setHours(hours, minutes, 0, 0);
-
-            return departureDateTime >= currentDateTime && departureDateTime <= tenMinutesLater;
-        }
-        return false;
-    });
-
-    console.log(`Filtered stop times: ${filteredStopTimes.length}`);
-
-    return filteredStopTimes.map(startStopTime => {
-        const trip = trips.find(t => t.trip_id === startStopTime.trip_id);
-        const endStopTime = stopTimes.find(st => st.trip_id === startStopTime.trip_id && st.stop_id === endStop.stop_id);
-        return { startStopTime, endStopTime, routeId: trip ? trip.route_id : '' };
-    });
-};
-
-const matchLiveData = (tripUpdates: any[], vehiclePositions: any[], stopTime: StopTime, routeId: string) => {
     if (!tripUpdates || !vehiclePositions) {
+        console.log("No live data available");
         return { liveArrivalTime: 'N/A', livePosition: 'N/A' };
     }
+
+    console.log(`Matching live data for route ${routeId}, stop ${stopTime.stop_id}`);
+
     const relevantTripUpdates = tripUpdates.filter(update => {
         if (!update.tripUpdate || !update.tripUpdate.trip || !update.tripUpdate.stopTimeUpdate) {
             return false;
         }
 
-        return matchRouteIds(routeId, update.tripUpdate.trip.routeId) &&
+        const matched = matchRouteIds(routeId, update.tripUpdate.trip.routeId) &&
             update.tripUpdate.stopTimeUpdate.some((stu: any) => stu.stopId === stopTime.stop_id);
+
+        if (matched) {
+            console.log(`Found matching trip update for route ${routeId}`);
+        }
+
+        return matched;
     });
 
     if (relevantTripUpdates.length === 0) {
-        return null;
+        console.log(`No relevant trip updates found for route ${routeId}`);
+        return { liveArrivalTime: 'N/A', livePosition: 'N/A' };
     }
 
     const closestTripUpdate = relevantTripUpdates.reduce((closest, current) => {
-        const closestTime = closest.tripUpdate.stopTimeUpdate.find((stu: any) => stu.stopId === stopTime.stop_id)?.arrival?.time || 0;
-        const currentTime = current.tripUpdate.stopTimeUpdate.find((stu: any) => stu.stopId === stopTime.stop_id)?.arrival?.time || 0;
-        const scheduledTime = new Date(`2024-08-27T${stopTime.arrival_time}`).getTime() / 1000;
+        const closestTime = closest.tripUpdate.stopTimeUpdate.find((stu: any) => stu.stopId === stopTime.stop_id)?.arrival?.time;
+        const currentTime = current.tripUpdate.stopTimeUpdate.find((stu: any) => stu.stopId === stopTime.stop_id)?.arrival?.time;
 
-        return Math.abs(currentTime - scheduledTime) < Math.abs(closestTime - scheduledTime) ? current : closest;
+        if (!closestTime || !currentTime) return closest;
+
+        const closestDate = new Date(parseInt(closestTime) * 1000);
+        const currentDate = new Date(parseInt(currentTime) * 1000);
+        const scheduledTime = new Date(`${userDateTime.toISOString().split('T')[0]}T${stopTime.arrival_time}`);
+
+        return Math.abs(currentDate.getTime() - scheduledTime.getTime()) < Math.abs(closestDate.getTime() - scheduledTime.getTime()) ? current : closest;
     });
 
-    const relevantVehiclePosition = vehiclePositions.find(position =>
-        matchRouteIds(routeId, position.vehicle.trip.routeId) &&
-        position.vehicle.trip.tripId === closestTripUpdate.tripUpdate.trip.tripId
-    );
+    console.log(`Closest trip update: ${JSON.stringify(closestTripUpdate)}`);
+
+    const relevantVehiclePosition = vehiclePositions.find(position => {
+        const positionTripId = position.vehicle?.trip?.tripId;
+        const positionRouteId = position.vehicle?.trip?.routeId;
+
+        console.log(`Checking vehicle position with tripId: ${positionTripId}, routeId: ${positionRouteId}`);
+
+        return matchRouteIds(routeId, positionRouteId) && positionTripId === closestTripUpdate.tripUpdate.trip.tripId;
+    });
+
+    if (!relevantVehiclePosition) {
+        console.log(`No matching vehicle position found for tripId: ${closestTripUpdate.tripUpdate.trip.tripId}`);
+    } else {
+        console.log(`Relevant vehicle position found: ${JSON.stringify(relevantVehiclePosition)}`);
+    }
 
     const stopTimeUpdate = closestTripUpdate.tripUpdate.stopTimeUpdate.find((stu: any) => stu.stopId === stopTime.stop_id);
 
+    let liveArrivalTime = 'N/A';
+    if (stopTimeUpdate?.arrival?.time) {
+        console.log(`Raw arrival time: ${stopTimeUpdate.arrival.time}`);
+        const arrivalDate = new Date(parseInt(stopTimeUpdate.arrival.time) * 1000);
+        // Convert to Australia/Brisbane timezone
+        liveArrivalTime = arrivalDate.toLocaleTimeString('en-AU', {
+            timeZone: 'Australia/Brisbane',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+    }
+
     return {
-        liveArrivalTime: stopTimeUpdate?.arrival?.time
-            ? new Date(stopTimeUpdate.arrival.time * 1000).toLocaleTimeString('en-AU', {
-                timeZone: 'Australia/Brisbane',
-                hour: '2-digit',
-                minute: '2-digit',
-                hour12: false
-            })
-            : 'N/A',
+        liveArrivalTime: liveArrivalTime,
         livePosition: relevantVehiclePosition
             ? `${relevantVehiclePosition.vehicle.position.latitude}, ${relevantVehiclePosition.vehicle.position.longitude}`
             : 'N/A',
@@ -250,18 +196,10 @@ const calculateTravelTime = (startTime: string, endTime: string): string => {
     const [startHours, startMinutes] = startTime.split(':').map(Number);
     const [endHours, endMinutes] = endTime.split(':').map(Number);
 
-    let startDateTime = new Date(0);
-    let endDateTime = new Date(0);
+    let diffMinutes = ((endHours * 60 + endMinutes) - (startHours * 60 + startMinutes) + 1440) % 1440;
 
-    startDateTime.setHours(startHours, startMinutes);
-    endDateTime.setHours(endHours, endMinutes);
+    if (diffMinutes === 0) diffMinutes = 1440;
 
-    if (endDateTime < startDateTime) {
-        endDateTime.setDate(endDateTime.getDate() + 1);
-    }
-
-    const diffMs = endDateTime.getTime() - startDateTime.getTime();
-    const diffMinutes = Math.floor(diffMs / 60000);
     const hours = Math.floor(diffMinutes / 60);
     const minutes = diffMinutes % 60;
 
@@ -272,23 +210,143 @@ const calculateTravelTime = (startTime: string, endTime: string): string => {
     }
 };
 
+const getRouteStops = (
+    route: string,
+    routesDF: Dataframe,
+    stopsDF: Dataframe,
+    stopTimesDF: Dataframe,
+    tripsDF: Dataframe
+): any[] => {
+    const routeInfo = routesDF.filter(row => row.route_short_name === route).data[0];
+    if (!routeInfo) {
+        console.log("No route info found for route:", route);
+        return [];
+    }
+
+    // Filter trips by route_id
+    const routeTrips = tripsDF.filter(row => row.route_id === routeInfo.route_id);
+    console.log(`Number of trips found for route: ${routeTrips.data.length}`);
+
+    // Join stop_times with trips to get direction_id, then join with stops to get stop details
+    const stopTimesWithTrips = stopTimesDF.join(routeTrips, 'trip_id');
+    const allStopTimes = stopTimesWithTrips.join(stopsDF, 'stop_id')
+        .select(['stop_id', 'stop_name', 'stop_sequence', 'direction_id']);
+
+    console.log(`Total stop times: ${allStopTimes.data.length}`);
+    if (allStopTimes.data.length > 0) {
+        console.log("Sample stop time record:", JSON.stringify(allStopTimes.data[0]));
+    }
+
+    // Sort by direction_id first, then by stop_sequence within each direction
+    const sortedStopTimes = new Dataframe(allStopTimes.data).sort('direction_id').sort('stop_sequence');
+
+    // Get unique stops for each direction with full details
+    const outboundStops = sortedStopTimes
+        .filter((row: { direction_id: string; }) => row.direction_id === '0')
+        .distinct('stop_id')
+        .data;
+
+    const inboundStops = sortedStopTimes
+        .filter((row: { direction_id: string; }) => row.direction_id === '1')
+        .distinct('stop_id')
+        .data
+
+    console.log(`Outbound stops: ${outboundStops.length}, Inbound stops: ${inboundStops.length}`);
+
+    // Combine outbound and inbound stops
+    const combinedStops = [...outboundStops, ...inboundStops];
+
+    console.log(`Total combined stops: ${combinedStops.length}`);
+
+    // Remove duplicates at the start/end if it's a loop
+    if (combinedStops.length > 0 && combinedStops[0].stop_id === combinedStops[combinedStops.length - 1].stop_id) {
+        combinedStops.pop();
+    }
+
+    // At this point, combinedStops should contain the full stop details including stop_name
+    console.log("Final combined stops:", JSON.stringify(combinedStops, null, 2));
+
+    return combinedStops;
+};
+
+const filterTripsForUpcomingDepartures = (
+    stopTimesDF: Dataframe,
+    tripsDF: Dataframe,
+    routesDF: Dataframe,
+    route: string,
+    startStop: any,
+    endStop: any,
+    currentDateTime: Date,
+    calendarDF: Dataframe,
+    calendarDatesDF: Dataframe
+) => {
+    const tenMinutesLater = new Date(currentDateTime.getTime() + 10 * 60000);
+
+    const isServiceRunning = (serviceId: string, date: Date): boolean => {
+        const dayOfWeek = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'][date.getDay()];
+        const dateString = date.toISOString().split('T')[0].replace(/-/g, '');
+
+        const exceptionRow = calendarDatesDF
+            .filter(row => row.service_id === serviceId && row.date === dateString)
+            .data[0];
+
+        if (exceptionRow) {
+            return exceptionRow.exception_type === '1';
+        }
+
+        const serviceCalendar = calendarDF.filter(row => row.service_id === serviceId).data[0];
+        if (!serviceCalendar) return false;
+
+        const startDate = new Date(serviceCalendar.start_date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'));
+        const endDate = new Date(serviceCalendar.end_date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'));
+
+        return date >= startDate && date <= endDate && serviceCalendar[dayOfWeek] === '1';
+    };
+
+    const filteredStopTimes = stopTimesDF.filter(row => {
+        if (row.stop_id === startStop.stop_id) {
+            const trip = tripsDF.filter(t => t.trip_id === row.trip_id).data[0];
+            if (!trip || !isServiceRunning(trip.service_id, currentDateTime)) {
+                return false;
+            }
+            const routeInfo = routesDF.filter(r => r.route_id === trip.route_id).data[0];
+            if (routeInfo.route_short_name !== route) {
+                return false;
+            }
+            const departureTime = row.departure_time || row.arrival_time;
+            const [hours, minutes] = departureTime.split(':').map(Number);
+            const departureDateTime = new Date(currentDateTime);
+            departureDateTime.setHours(hours, minutes, 0, 0);
+
+            return departureDateTime >= currentDateTime && departureDateTime <= tenMinutesLater;
+        }
+        return false;
+    });
+
+    return filteredStopTimes.data.map(startStopTime => {
+        const trip = tripsDF.filter(t => t.trip_id === startStopTime.trip_id).data[0];
+        const endStopTime = stopTimesDF.filter(st => st.trip_id === startStopTime.trip_id && st.stop_id === endStop.stop_id).data[0];
+        return { startStopTime, endStopTime, routeId: trip ? trip.route_id : '' };
+    });
+};
 
 const main = async () => {
     console.log("Welcome to the South East Queensland Route Planner!");
 
-    const routes = await loadCSV('./static-data/routes.txt') as Route[];
-    const stops = await loadCSV('./static-data/stops.txt') as Stop[];
-    const stopTimes = await loadCSV('./static-data/stop_times.txt') as StopTime[];
-    const trips = await loadCSV('./static-data/trips.txt') as Trip[];
-    const calendar = await loadCSV('./static-data/calendar.txt') as Calendar[];
+    const routesDF = await Dataframe.loadCSV('./static-data/routes.txt');
+    const stopsDF = await Dataframe.loadCSV('./static-data/stops.txt');
+    const stopTimesDF = await Dataframe.loadCSV('./static-data/stop_times.txt');
+    const tripsDF = await Dataframe.loadCSV('./static-data/trips.txt');
+    const calendarDF = await Dataframe.loadCSV('./static-data/calendar.txt');
+    const calendarDatesDF = await Dataframe.loadCSV('./static-data/calendar_dates.txt');
 
     const tripUpdates = (await loadJSON('http://127.0.0.1:5343/gtfs/seq/trip_updates.json', 'trip_updates.json')).entity;
     const vehiclePositions = (await loadJSON('http://127.0.0.1:5343/gtfs/seq/vehicle_positions.json', 'vehicle_positions.json')).entity;
     const alerts = (await loadJSON('http://127.0.0.1:5343/gtfs/seq/alerts.json', 'alerts.json')).entity;
 
     while (true) {
-        const route = getRoute(routes);
-        const stopsForRoute = getRouteStops(route, routes, stops, stopTimes, trips);
+        const route = getRoute(routesDF);
+        const stopsForRoute = getRouteStops(route, routesDF, stopsDF, stopTimesDF, tripsDF);
 
         if (stopsForRoute.length === 0) {
             console.log("No stops found for this route. Please enter a valid bus route.");
@@ -314,20 +372,29 @@ const main = async () => {
 
         console.log(`You've chosen to travel on ${date} at ${time}.`);
 
-        const upcomingStopTimes = filterTripsForUpcomingDepartures(stopTimes, trips, startAndEndStops.start, startAndEndStops.end, currentDateTime, calendar);
+        const upcomingStopTimes = filterTripsForUpcomingDepartures(
+            stopTimesDF,
+            tripsDF,
+            routesDF,
+            route,
+            startAndEndStops.start,
+            startAndEndStops.end,
+            currentDateTime,
+            calendarDF,
+            calendarDatesDF
+        );
 
         const result = upcomingStopTimes.map(({ startStopTime, endStopTime, routeId }) => {
-            const trip = trips.find(trip => trip.trip_id === startStopTime.trip_id);
-            const routeDetails = routes.find(route => route.route_id === routeId);
+            const trip = tripsDF.filter(row => row.trip_id === startStopTime.trip_id).data[0];
+            const routeDetails = routesDF.filter(row => row.route_id === routeId).data[0];
 
-            const liveData = matchLiveData(tripUpdates, vehiclePositions, startStopTime, routeId);
-
+            const liveData = matchLiveData(tripUpdates, vehiclePositions, startStopTime, routeId, currentDateTime);
             const startTime = startStopTime.arrival_time || startStopTime.departure_time;
             const endTime = endStopTime ? (endStopTime.arrival_time || endStopTime.departure_time) : null;
 
             const estimatedTravelTime = endTime ? calculateTravelTime(startTime, endTime) : "N/A";
 
-            const scheduledArrivalTime = new Date(`1970-01-01T${startTime}`).toLocaleTimeString('en-AU', {
+            const scheduledArrivalTime = new Date(`${date}T${startTime}+10:00`).toLocaleTimeString('en-AU', {
                 timeZone: 'Australia/Brisbane',
                 hour: '2-digit',
                 minute: '2-digit',
@@ -338,6 +405,7 @@ const main = async () => {
                 "Route Short Name": routeDetails?.route_short_name || "N/A",
                 "Route Long Name": routeDetails?.route_long_name || "N/A",
                 "Service ID": trip?.service_id || "N/A",
+                "Trip ID": trip?.trip_id || "N/A",
                 "Heading Sign": trip?.trip_headsign || "N/A",
                 "Scheduled Arrival Time": scheduledArrivalTime,
                 "Live Arrival Time": liveData?.liveArrivalTime || "N/A",
@@ -345,7 +413,7 @@ const main = async () => {
                 "Estimated Travel Time": estimatedTravelTime,
             };
         });
-        
+
         if (result.length > 0) {
             console.table(result);
         } else {
