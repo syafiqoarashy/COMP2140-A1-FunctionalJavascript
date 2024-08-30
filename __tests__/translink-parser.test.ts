@@ -1,6 +1,5 @@
 import {
     loadJSON,
-    matchRouteIds,
     calculateTravelTime,
     getRouteStops,
     filterTripsForUpcomingDepartures,
@@ -12,11 +11,6 @@ jest.mock('node:fs/promises');
 jest.mock('node-fetch');
 
 describe('translink-parser functions', () => {
-    test('matchRouteIds', () => {
-        expect(matchRouteIds('66-3734', '66-3735')).toBe(true);
-        expect(matchRouteIds('66-3734', '67-3734')).toBe(false);
-    });
-
     test('calculateTravelTime', () => {
         expect(calculateTravelTime('10:00', '10:30')).toBe('30 minutes');
         expect(calculateTravelTime('10:00', '11:30')).toBe('1 hour 30 minutes');
@@ -42,8 +36,10 @@ describe('translink-parser functions', () => {
 
     test('filterTripsForUpcomingDepartures', () => {
         const stopTimesDF = new Dataframe([
-            { trip_id: 'trip1', stop_id: '1', departure_time: '10:00:00' },
-            { trip_id: 'trip2', stop_id: '1', departure_time: '10:05:00' },
+            { trip_id: 'trip1', stop_id: '1', stop_sequence: '1', departure_time: '10:00:00' },
+            { trip_id: 'trip2', stop_id: '1', stop_sequence: '1', departure_time: '10:05:00' },
+            { trip_id: 'trip1', stop_id: '2', stop_sequence: '2', departure_time: '10:15:00' },
+            { trip_id: 'trip2', stop_id: '2', stop_sequence: '2', departure_time: '10:20:00' },
         ]);
         const tripsDF = new Dataframe([
             { trip_id: 'trip1', route_id: '66-3734', service_id: 'service1' },
@@ -58,9 +54,21 @@ describe('translink-parser functions', () => {
         const currentDateTime = new Date('2024-08-29T09:55:00+10:00');
         const startStop = { stop_id: '1' };
         const endStop = { stop_id: '2' };
+        const startStopIndex = 1;
+        const endStopIndex = 2;
 
         const upcomingTrips = filterTripsForUpcomingDepartures(
-            stopTimesDF, tripsDF, routesDF, '66', startStop, endStop, currentDateTime, calendarDF, calendarDatesDF
+            stopTimesDF,
+            tripsDF,
+            routesDF,
+            '66',
+            startStop,
+            endStop,
+            startStopIndex,
+            endStopIndex,
+            currentDateTime,
+            calendarDF,
+            calendarDatesDF
         );
 
         console.log('Upcoming Trips:', upcomingTrips);

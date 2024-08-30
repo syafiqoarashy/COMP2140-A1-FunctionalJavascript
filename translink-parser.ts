@@ -6,7 +6,7 @@ import Dataframe from "./dataframe";
 
 const prompt = promptSync();
 const CACHE_DIR = './cached-data';
-const CACHE_DURATION = 5 * 60 * 1000;
+const CACHE_DURATION = 5 * 60 * 1000; // Cache every 5 minutes
 
 /**
  * Loads JSON data from a URL or cache file.
@@ -23,17 +23,22 @@ export const loadJSON = async (url: string, cacheFile: string): Promise<any> => 
         const now = Date.now();
 
         if (now - stats.mtimeMs < CACHE_DURATION) {
+            console.log(`Using cached data for ${cacheFile}`);
             return JSON.parse(await fs.readFile(cachePath, 'utf-8'));
         }
-    } catch (err) {}
+    } catch (err) {
+        console.log(`Error retrieving cached data ${err}`);
+    }
 
     try {
+        console.log(`Fetching fresh data for ${cacheFile}`);
         const response = await fetch(url);
         if (!response.ok) {
             throw new Error(`Failed to fetch data from ${url}`);
         }
         const data = await response.json();
 
+        await fs.mkdir(CACHE_DIR, { recursive: true });
         await fs.writeFile(cachePath, JSON.stringify(data, null, 2), 'utf-8');
         return data;
     } catch (error) {
@@ -45,18 +50,6 @@ export const loadJSON = async (url: string, cacheFile: string): Promise<any> => 
             return null;
         }
     }
-};
-
-/**
- * Matches route IDs by comparing their main components.
- * @param {string} staticRouteId - The route ID from static data.
- * @param {string} realtimeRouteId - The route ID from real-time data.
- * @returns {boolean} Whether the route IDs match.
- */
-export const matchRouteIds = (staticRouteId: string, realtimeRouteId: string): boolean => {
-    const staticMainRoute = staticRouteId.split('-')[0];
-    const realtimeMainRoute = realtimeRouteId.split('-')[0];
-    return staticMainRoute === realtimeMainRoute;
 };
 
 /**
@@ -79,7 +72,7 @@ const getRoute = (routesDF: Dataframe): string => {
  * @param {any[]} stops - The list of available stops on the route.
  * @returns {object|null} - The selected start and end stops.
  */
-const getStartAndEndStops = (stops: any[]): { start: any, end: any } | null => {
+const getStartAndEndStops = (stops: any[]): { startIndex: number; endIndex: number; start: any; end: any } => {
     while (true) {
         const input = prompt("What is your start and end stop on the route? (e.g., 1 - 2) ");
         const match = input.match(/^\s*(\d+)\s*-\s*(\d+)\s*$/);
@@ -100,7 +93,9 @@ const getStartAndEndStops = (stops: any[]): { start: any, end: any } | null => {
 
         return {
             start: stops[startIndex - 1],
-            end: stops[endIndex - 1]
+            end: stops[endIndex - 1],
+            startIndex: startIndex,
+            endIndex: endIndex
         };
     }
 };
@@ -156,8 +151,6 @@ export const matchLiveData = (
         return { liveArrivalTime: 'N/A', livePosition: 'N/A' };
     }
 
-    console.log(`Matching live data for route ${routeId}, trip ${tripId}, stop ${stopTime.stop_id}`);
-
     const relevantTripUpdate = tripUpdates.find(update =>
         update.tripUpdate &&
         update.tripUpdate.trip &&
@@ -170,32 +163,29 @@ export const matchLiveData = (
         return { liveArrivalTime: 'N/A', livePosition: 'N/A' };
     }
 
-    console.log(`Relevant trip update: ${JSON.stringify(relevantTripUpdate)}`);
+    const vehicleId = relevantTripUpdate.tripUpdate.vehicle?.id;
 
     const stopTimeUpdate = relevantTripUpdate.tripUpdate.stopTimeUpdate.find((stu: any) => stu.stopId === stopTime.stop_id);
 
     let liveArrivalTime = 'N/A';
     if (stopTimeUpdate?.arrival?.time || stopTimeUpdate?.departure?.time) {
         const time = stopTimeUpdate.arrival?.time || stopTimeUpdate.departure?.time;
-        console.log(`Raw arrival/departure time: ${time}`);
         const arrivalDate = new Date(parseInt(time) * 1000);
         liveArrivalTime = arrivalDate.toLocaleTimeString('en-AU', {
             timeZone: 'Australia/Brisbane',
             hour: '2-digit',
             minute: '2-digit',
+            second: '2-digit',
             hour12: false
         });
     }
 
     const relevantVehiclePosition = vehiclePositions.find(position =>
-        position.vehicle.trip.tripId === tripId &&
-        position.vehicle.trip.routeId === routeId
+        position.vehicle?.vehicle?.id === vehicleId || position.vehicle?.id === vehicleId
     );
 
     if (!relevantVehiclePosition) {
-        console.log(`No matching vehicle position found for trip ${tripId} on route ${routeId}`);
-    } else {
-        console.log(`Relevant vehicle position found: ${JSON.stringify(relevantVehiclePosition)}`);
+        console.log(`No matching vehicle position found for vehicle ID ${vehicleId}`);
     }
 
     return {
@@ -252,24 +242,14 @@ export const getRouteStops = (
         return [];
     }
 
-    // Filter trips by route_id
     const routeTrips = tripsDF.filter(row => row.route_id === routeInfo.route_id);
-    console.log(`Number of trips found for route: ${routeTrips.data.length}`);
 
-    // Join stop_times with trips to get direction_id, then join with stops to get stop details
     const stopTimesWithTrips = stopTimesDF.join(routeTrips, 'trip_id');
     const allStopTimes = stopTimesWithTrips.join(stopsDF, 'stop_id')
         .select(['stop_id', 'stop_name', 'stop_sequence', 'direction_id']);
 
-    console.log(`Total stop times: ${allStopTimes.data.length}`);
-    if (allStopTimes.data.length > 0) {
-        console.log("Sample stop time record:", JSON.stringify(allStopTimes.data[0]));
-    }
-
-    // Sort by direction_id first, then by stop_sequence within each direction
     const sortedStopTimes = new Dataframe(allStopTimes.data).sort('direction_id').sort('stop_sequence');
 
-    // Get unique stops for each direction with full details
     const outboundStops = sortedStopTimes
         .filter((row: { direction_id: string; }) => row.direction_id === '0')
         .distinct('stop_id')
@@ -280,19 +260,11 @@ export const getRouteStops = (
         .distinct('stop_id')
         .data
 
-    console.log(`Outbound stops: ${outboundStops.length}, Inbound stops: ${inboundStops.length}`);
-
-    // Combine outbound and inbound stops
     const combinedStops = [...outboundStops, ...inboundStops];
 
-    console.log(`Total combined stops: ${combinedStops.length}`);
-
-    // Remove duplicates at the start/end if it's a loop
     if (combinedStops.length > 0 && combinedStops[0].stop_id === combinedStops[combinedStops.length - 1].stop_id) {
         combinedStops.pop();
     }
-
-    console.log("Final combined stops:", JSON.stringify(combinedStops, null, 2));
 
     return combinedStops;
 };
@@ -305,6 +277,8 @@ export const getRouteStops = (
  * @param {string} route - The selected bus route.
  * @param {any} startStop - The selected start stop.
  * @param {any} endStop - The selected end stop.
+ * @param startStopIndex
+ * @param endStopIndex
  * @param {Date} currentDateTime - The current date and time.
  * @param {Dataframe} calendarDF - The Dataframe containing calendar information.
  * @param {Dataframe} calendarDatesDF - The Dataframe containing calendar dates information.
@@ -317,20 +291,17 @@ export const filterTripsForUpcomingDepartures = (
     route: string,
     startStop: any,
     endStop: any,
+    startStopIndex: number,
+    endStopIndex: number,
     currentDateTime: Date,
     calendarDF: Dataframe,
     calendarDatesDF: Dataframe
 ): any[] => {
     const tenMinutesLater = new Date(currentDateTime.getTime() + 10 * 60000);
 
-    console.log('Current DateTime:', currentDateTime);
-    console.log('Ten Minutes Later:', tenMinutesLater);
-
     const isServiceRunning = (serviceId: string, date: Date): boolean => {
         const dayOfWeek = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'][date.getDay()];
         const dateString = date.toISOString().split('T')[0].replace(/-/g, '');
-
-        console.log('Checking service:', serviceId, 'for date:', dateString, 'day:', dayOfWeek);
 
         const exceptionRow = calendarDatesDF
             .filter(row => row.service_id === serviceId && row.date === dateString)
@@ -346,14 +317,11 @@ export const filterTripsForUpcomingDepartures = (
         const startDate = new Date(serviceCalendar.start_date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'));
         const endDate = new Date(serviceCalendar.end_date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'));
 
-        console.log('Service calendar:', serviceCalendar);
-        console.log('Service running:', date >= startDate && date <= endDate && serviceCalendar[dayOfWeek] === '1');
-
         return date >= startDate && date <= endDate && serviceCalendar[dayOfWeek] === '1';
     };
 
     const filteredStopTimes = stopTimesDF.filter(row => {
-        if (row.stop_id === startStop.stop_id) {
+        if (row.stop_id === startStop.stop_id && parseInt(row.stop_sequence) === startStopIndex) {
             const trip = tripsDF.filter(t => t.trip_id === row.trip_id).data[0];
             if (!trip || !isServiceRunning(trip.service_id, currentDateTime)) {
                 return false;
@@ -367,18 +335,18 @@ export const filterTripsForUpcomingDepartures = (
             const departureDateTime = new Date(currentDateTime);
             departureDateTime.setHours(hours, minutes, 0, 0);
 
-            console.log('Departure Time:', departureTime, 'Departure DateTime:', departureDateTime);
-
             return departureDateTime >= currentDateTime && departureDateTime <= tenMinutesLater;
         }
         return false;
     });
 
-    console.log('Filtered Stop Times:', filteredStopTimes.data);
-
     return filteredStopTimes.data.map(startStopTime => {
         const trip = tripsDF.filter(t => t.trip_id === startStopTime.trip_id).data[0];
-        const endStopTime = stopTimesDF.filter(st => st.trip_id === startStopTime.trip_id && st.stop_id === endStop.stop_id).data[0];
+        const endStopTime = stopTimesDF.filter(st =>
+            st.trip_id === startStopTime.trip_id &&
+            st.stop_id === endStop.stop_id &&
+            parseInt(st.stop_sequence) === endStopIndex
+        ).data[0];
         return { startStopTime, endStopTime, routeId: trip ? trip.route_id : '' };
     });
 };
@@ -435,6 +403,8 @@ const main = async () => {
             route,
             startAndEndStops.start,
             startAndEndStops.end,
+            startAndEndStops.startIndex,
+            startAndEndStops.endIndex,
             currentDateTime,
             calendarDF,
             calendarDatesDF
@@ -454,6 +424,7 @@ const main = async () => {
                 timeZone: 'Australia/Brisbane',
                 hour: '2-digit',
                 minute: '2-digit',
+                second: '2-digit',
                 hour12: false
             });
 
@@ -461,7 +432,6 @@ const main = async () => {
                 "Route Short Name": routeDetails?.route_short_name || "N/A",
                 "Route Long Name": routeDetails?.route_long_name || "N/A",
                 "Service ID": trip?.service_id || "N/A",
-                "Trip ID": trip?.trip_id || "N/A",
                 "Heading Sign": trip?.trip_headsign || "N/A",
                 "Scheduled Arrival Time": scheduledArrivalTime,
                 "Live Arrival Time": liveData?.liveArrivalTime || "N/A",
